@@ -1,0 +1,265 @@
+#pragma kernel SteeringForcesCS;
+#pragma kernel BoidsDataCS;
+
+struct BoidData
+{
+    float3 velocity;
+    float3 position;
+};
+
+struct ObstacleData
+{
+    float radius;
+    float3 position;
+};
+
+#define THREAD_GROUP_SIZE 128
+
+StructuredBuffer<BoidData> _BoidsDataBuffer;
+RWStructuredBuffer<BoidData> _BoidsDataBufferRw;
+StructuredBuffer<float3> _BoidsSteeringForcesBuffer;
+RWStructuredBuffer<float3> _BoidsSteeringForcesBufferRw;
+StructuredBuffer<ObstacleData> _ObstaclesBuffer;
+
+int _BoidsCount;
+int _ObstaclesCount;
+
+float _DeltaTime;
+
+float _CohesionRadius;
+float _AlignmentRadius;
+float _SeparationRadius;
+
+float _BoidMaxSpeed;
+float _BoidMaxSteeringForce;
+
+float _CohesionWeight;
+float _AlignmentWeight;
+float _SeparationWeight;
+float _SimulationBoundsAvoidWeight;
+float _ObstacleAvoidanceWeight;
+
+float4 _SimulationCenter;
+float4 _SimulationDimensions;
+
+// Limits the magnitude of a give vector to a specified maximum value.
+float3 Limit(float3 vec, float max)
+{
+    float lengthSq = dot(vec, vec);
+
+    if(lengthSq > max * max && lengthSq > 0)
+    {
+        float length = sqrt(lengthSq);
+        return vec * (max/length);
+    }
+
+    return vec;
+}
+
+// Returns an acceleration for the boid based on it reaching the simulation bounds.
+float3 CheckSimulationBounds(float3 pos)
+{
+    float3 wc = _SimulationCenter.xyz;
+    float3 wd = _SimulationDimensions.xyz;
+
+    float3 acc = float3(0, 0, 0);
+
+    acc.x = pos.x < wc.x - wd.x * 0.5f ? 1.0f : (pos.x > wc.x + wd.x * 0.5f ? -1.0f : 0.0f);
+    acc.y = pos.y < wc.y - wd.y * 0.5f ? 1.0f : (pos.y > wc.y + wd.y * 0.5f ? -1.0f : 0.0f);
+    acc.z = pos.z < wc.z - wd.z * 0.5f ? 1.0f : (pos.z > wc.z + wd.z * 0.5f ? -1.0f : 0.0f);
+
+    return acc;
+}
+
+// Shared Memory Array
+// IMPORTANT FOR PRESENTATION
+// groupshared keyword creates a variable in the shared memory of the thread group.
+// boid data shared by the entire thread group, retrieves data from other thread groups in parallel
+groupshared BoidData boid_data[THREAD_GROUP_SIZE];
+groupshared ObstacleData obstacle_data[THREAD_GROUP_SIZE];
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void SteeringForcesCS (
+    uint3 id : SV_DispatchThreadID, // thread group unique id
+    uint gi : SV_GroupIndex // 1D version of group thread id
+    )
+{
+    // Self boid data retrieval
+    const unsigned int idx = id.x;
+    const float3 p_pos = _BoidsDataBuffer[idx].position;
+    const float3 p_vel = _BoidsDataBuffer[idx].velocity;
+
+    // Force output
+    float3 force = float3(0, 0, 0);
+
+    // Position offsets influenced by behaviors
+    float3 separationPosOffset = float3(0, 0, 0);
+    float3 alignmentPosOffset = float3(0, 0, 0);
+    float3 cohesionPosOffset = float3(0, 0, 0);
+
+    // cumulative count of voids that need to be influenced
+    int separationBoidsCount = 0;
+    int alignmentBoidsCount = 0;
+    int cohesionBoidsCount = 0;
+    
+    // accumulated steering forces
+    float3 separationSteering = float3(0, 0, 0);
+    float3 alignmentSteering = float3(0, 0, 0);
+    float3 cohesionSteering = float3(0, 0, 0);
+    
+    // loop unrolling
+    // ALSO IMPORTANT
+    [loop]
+    for (uint n_block_id = 0; n_block_id < (uint)_BoidsCount; n_block_id += THREAD_GROUP_SIZE)
+    {
+        boid_data[gi] = _BoidsDataBuffer[n_block_id + gi];
+        // Sync threads to ensure that every boid in the iterated thread group is retrieved before continuing.
+        // Threads individually retrieve the boid that share their relative group index.
+        GroupMemoryBarrierWithGroupSync();
+
+        // Conditional execution and memory coalescing
+        // Iterates over the group that was just retrieved.
+        [unroll]
+        for (int n_tile_id = 0; n_tile_id < THREAD_GROUP_SIZE; n_tile_id++)
+        {
+            const float3 n_pos = boid_data[n_tile_id].position;
+            const float3 n_vel = boid_data[n_tile_id].velocity;
+
+            const float3 diff = p_pos - n_pos;
+            const float dist = sqrt(dot(diff, diff));
+
+            //Separation
+            if(dist > 0.0f && dist <= _SeparationRadius)
+            {
+                float3 repulse = normalize(p_pos - n_pos);
+                repulse /= dist;
+                separationPosOffset += repulse;
+                separationBoidsCount++;
+            }
+
+            //Alignment
+            if(dist > 0.0f && dist <= _AlignmentRadius)
+            {
+                alignmentPosOffset += n_vel;
+                alignmentBoidsCount++;
+            }
+
+            //Cohesion
+            if(dist > 0.0f && dist <= _CohesionRadius)
+            {
+                cohesionPosOffset += n_pos;
+                cohesionBoidsCount++;
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Calculate separation force as an average of all effectors scaled to maximum speed and force values.
+    if (separationBoidsCount > 0)
+    {
+        separationSteering = separationPosOffset / (float)separationBoidsCount; // Calc Avg
+        separationSteering = normalize(separationSteering) * _BoidMaxSpeed; // Adjust to max speed
+        separationSteering = separationSteering - p_vel; // Calc steering force.
+        separationSteering = Limit(separationSteering, _BoidMaxSteeringForce); // Limit to steering force
+    }
+
+    // Repeat for cohesion...
+    if (cohesionBoidsCount > 0)
+    {
+        cohesionPosOffset = cohesionPosOffset / (float)cohesionBoidsCount; // Calc Avg
+        cohesionSteering = cohesionPosOffset - p_pos; // get centroid
+        cohesionSteering = normalize(cohesionSteering) * _BoidMaxSpeed; // Adjust to max speed
+        cohesionSteering = cohesionSteering - p_vel; // Get force to based on current velocity to turn boid.
+        cohesionSteering = Limit(cohesionSteering, _BoidMaxSteeringForce); // Limit to steering force
+    }
+
+    // ...and alignment
+    if (alignmentBoidsCount > 0)
+    {
+        alignmentSteering = alignmentPosOffset / (float)alignmentBoidsCount; // Calc Avg
+        alignmentSteering = normalize(alignmentSteering) * _BoidMaxSpeed; // Adjust to max speed
+        alignmentSteering = alignmentSteering - p_vel; // Calc steering force.
+        alignmentSteering = Limit(alignmentSteering, _BoidMaxSteeringForce); // Limit to steering force
+    }
+
+    force += alignmentSteering * _AlignmentWeight;
+    force += cohesionSteering * _CohesionWeight;
+    force += separationSteering * _SeparationWeight;
+
+    _BoidsSteeringForcesBufferRw[idx] = force;
+
+    
+    // Position offsets influenced by behaviors
+    float3 avoidancePosOffset = float3(0, 0, 0);
+
+    // cumulative count of voids that need to be influenced
+    int avoidanceCount = 0;
+    
+    // accumulated steering forces
+    float3 avoidanceSteering = float3(0, 0, 0);
+    
+    // loop unrolling
+    // ALSO IMPORTANT
+    [loop]
+    for (uint n_block_id = 0; n_block_id < (uint)_ObstaclesCount; n_block_id += THREAD_GROUP_SIZE)
+    {
+        obstacle_data[gi] = _ObstaclesBuffer[n_block_id + gi];
+
+        GroupMemoryBarrierWithGroupSync();
+
+        // Conditional execution and memory coalescing
+        // Iterates over the group that was just retrieved.
+        [unroll]
+        for (int n_tile_id = 0; n_tile_id < THREAD_GROUP_SIZE; n_tile_id++)
+        {
+            const float3 n_pos = obstacle_data[n_tile_id].position;
+            const float n_radius = obstacle_data[n_tile_id].radius;
+
+            const float3 diff = p_pos - n_pos;
+            const float dist = sqrt(dot(diff, diff));
+            
+            //Separation
+            if(dist > 0.0f && dist <= n_radius)
+            {
+                float3 repulse = normalize(p_pos - n_pos);
+                repulse /= dist;
+                avoidancePosOffset += repulse;
+                avoidanceCount++;
+            }
+        }
+
+        GroupMemoryBarrierWithGroupSync();
+    }
+
+    // Calculate avoidance force against obstacles.
+    if (avoidanceCount > 0)
+    {
+        avoidanceSteering = avoidancePosOffset / (float)avoidanceCount; // Calc Avg
+        avoidanceSteering = normalize(avoidanceSteering) * _BoidMaxSpeed; // Adjust to max speed
+        avoidanceSteering = avoidanceSteering - p_vel; // Calc steering force.
+        avoidanceSteering = Limit(avoidanceSteering, _BoidMaxSteeringForce); // Limit to steering force
+    }
+
+    _BoidsSteeringForcesBufferRw[idx] += avoidanceSteering* _ObstacleAvoidanceWeight;
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void BoidsDataCS (
+    uint3 id : SV_DispatchThreadID // thread group unique id
+    )
+{
+    const unsigned int p_id = id;
+
+    BoidData boidData = _BoidsDataBufferRw[p_id];
+    float3 force = _BoidsSteeringForcesBuffer[p_id];
+
+    // Apply repelling force when approaching simulation bounds
+    force += CheckSimulationBounds(boidData.position) * _SimulationBoundsAvoidWeight;
+
+    boidData.velocity += force * _DeltaTime;
+    boidData.velocity = Limit(boidData.velocity, _BoidMaxSpeed);
+    boidData.position += boidData.velocity * _DeltaTime;
+
+    _BoidsDataBufferRw[p_id] = boidData;
+}
